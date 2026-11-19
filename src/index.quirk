@@ -1,0 +1,431 @@
+---
+SQLite databases: a file (or memory), SQL with `?` / `:name` parameters,
+rows as Maps, transactions with `with`. SQLite itself is built into Quirk:
+nothing to install.
+
+@example:
+use sqlite
+
+db := sqlite.open("app.db")                       // made if it isn't there
+db.script("CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)")
+
+id := db.insert("INSERT INTO todos (text) VALUES (?)", ["milk"])
+db.execute("UPDATE todos SET done = ? WHERE id = ?", [true, id])
+
+for row in db.query("SELECT id, text FROM todos WHERE done = :done", {"done": false}) {
+    print(row["text"])
+}
+left := db.value("SELECT count(*) FROM todos WHERE done = 0")
+
+with db.transaction() {                     // all of it, or none of it
+    db.execute("INSERT INTO todos (text) VALUES (?)", ["eggs"])
+    db.execute("INSERT INTO todos (text) VALUES (?)", ["bread"])
+}
+db.close()
+---
+from typing.primitives.string use { String }
+from typing.collections.list use { List }
+from typing.collections.map use { Map }
+from typing.exceptions.types use { RuntimeError, ValueError }
+
+extern define open_raw(path: String, mode: Int, busy_ms: Int) -> Int
+extern define open_error() -> String
+extern define close_raw(db: Int) -> Int
+extern define errmsg(db: Int) -> String
+extern define errcode(db: Int) -> Int
+extern define errstr(rc: Int) -> String
+extern define exec_raw(db: Int, sql: String) -> Int
+extern define prepare_raw(db: Int, sql: String) -> Int
+extern define finalize_raw(st: Int) -> Int
+extern define reset_raw(st: Int) -> Int
+extern define param_count(st: Int) -> Int
+extern define param_index(st: Int, name: String) -> Int
+extern define param_name(st: Int, i: Int) -> String
+extern define bind_int(st: Int, i: Int, v: Int) -> Int
+extern define bind_double(st: Int, i: Int, v: Double) -> Int
+extern define bind_text(st: Int, i: Int, v: String) -> Int
+extern define bind_null(st: Int, i: Int) -> Int
+extern define step_raw(st: Int) -> Int
+extern define column_count(st: Int) -> Int
+extern define column_name(st: Int, i: Int) -> String
+extern define column_value(st: Int, i: Int) -> Any
+extern define row_raw(st: Int) -> Map
+extern define changes(db: Int) -> Int
+extern define last_insert_rowid(db: Int) -> Int
+extern define in_transaction(db: Int) -> Int
+
+--- The version of SQLite built into Quirk ("3.54.1"). ---
+extern define version() -> String
+
+const _ROW: Int = 100
+const _DONE: Int = 101
+
+---
+What went wrong in the database: a constraint (a UNIQUE / NOT NULL / CHECK
+/ FOREIGN KEY), bad SQL, a locked or read-only file, a closed database.
+  `code` — SQLite's result code: `code % 256` is the primary one
+           (19 a constraint, 1 an SQL error, 5 busy, 8 read-only …);
+           the whole is the extended one (2067 UNIQUE, 1299 NOT NULL …)
+  `sql`  — the statement, when there was one
+
+@example:
+try {
+    db.execute("INSERT INTO users (email) VALUES (?)", [email])
+} catch (e: sqlite.Error) {
+    if e.is_constraint() { print("already taken") } else { throw }
+}
+---
+struct Error : RuntimeError {
+    code: Int
+    sql: String
+
+    define __init(self, message: String, code: Int = 1, sql: String = "") -> void {
+        super().__init(message)
+        self.code = code
+        self.sql = sql
+    }
+
+    --- A constraint failed: UNIQUE, NOT NULL, CHECK, FOREIGN KEY, PRIMARY KEY. ---
+    define is_constraint(self) -> Bool {
+        return self.code % 256 == 19
+    }
+
+    --- Another connection holds the lock (after waiting `busy_ms`). ---
+    define is_busy(self) -> Bool {
+        return self.code % 256 == 5 or self.code % 256 == 6
+    }
+}
+
+---
+Open the database in the file at `path` — made if it isn't there, unless
+`must_exist`. `":memory:"`: a new database in memory, gone when it's closed.
+  `read_only` — no writes (a write raises sqlite.Error)
+  `busy_ms`   — when another connection is writing: how long to wait for
+                it before raising (default 5 s)
+Close it with `db.close()`, or use `with sqlite.open(path) as db { … }`.
+---
+define open(path: String, read_only: Bool = false, must_exist: Bool = false, busy_ms: Int = 5000) -> Database {
+    mode := read_only ? 1 : (must_exist ? 2 : 0)
+    handle := open_raw(path, mode, busy_ms)
+    if handle == 0 { throw Error("sqlite: can't open " + path + ": " + open_error(), 14, "") }
+    db := Database()
+    db.path = path
+    db._db = handle
+    db._savepoints = 0
+    return db
+}
+
+---
+A connection to a database (`sqlite.open`). Each method runs one statement
+and is done with it: nothing to finalize or reset.
+
+Parameters: `?` in the SQL with a List (in order), or `:name` with a Map:
+    db.query("SELECT * FROM t WHERE a = ? AND b = ?", [1, "x"])
+    db.query("SELECT * FROM t WHERE a = :a AND b = :b", {"a": 1, "b": "x"})
+Values go in as they are — never pasted into the SQL, so they can't change
+it. Int, Double, String, Bool (stored as 1 / 0) and null.
+
+Rows come back as Maps, column name → value: Int, Double, String or null
+(SQLite has no Bool: a stored `true` reads back as 1).
+---
+struct Database {
+    path: String
+    _db: Int
+    _savepoints: Int
+
+    define __enter(self) -> Database {
+        return self
+    }
+
+    define __exit(self) -> void {
+        self.close()
+    }
+
+    --- Close it. Closing twice is fine; using it after raises sqlite.Error. ---
+    define close(self) -> void {
+        if self._db != 0 {
+            close_raw(self._db)
+            self._db = 0
+        }
+    }
+
+    define is_open(self) -> Bool {
+        return self._db != 0
+    }
+
+    ---
+    Run a statement that returns no rows (INSERT, UPDATE, DELETE, CREATE …).
+    Returns how many rows it changed.
+    ---
+    define execute(self, sql: String, params: Any = null) -> Int {
+        st := self._prepare(sql, params)
+        rc := step_raw(st)
+        while rc == _ROW { rc = step_raw(st) }
+        if rc != _DONE { self._fail_stmt(st, sql) }
+        finalize_raw(st)
+        return changes(self._db)
+    }
+
+    --- Run an INSERT; returns the new row's id (its INTEGER PRIMARY KEY). ---
+    define insert(self, sql: String, params: Any = null) -> Int {
+        self.execute(sql, params)
+        return last_insert_rowid(self._db)
+    }
+
+    ---
+    Run the same statement once per item of `rows` (each a List or a Map of
+    parameters), in one transaction. Returns how many rows changed in all.
+    ---
+    define execute_many(self, sql: String, rows: List) -> Int {
+        total := 0
+        with self.transaction() {
+            for params in rows { total = total + self.execute(sql, params) }
+        }
+        return total
+    }
+
+    --- Every row of a SELECT, as Maps (column name → value). ---
+    define query(self, sql: String, params: Any = null) -> List {
+        st := self._prepare(sql, params)
+        rows := []
+        rc := step_raw(st)
+        while rc == _ROW {
+            rows.append(row_raw(st))
+            rc = step_raw(st)
+        }
+        if rc != _DONE { self._fail_stmt(st, sql) }
+        finalize_raw(st)
+        return rows
+    }
+
+    --- The first row of a SELECT, or null when there's none. ---
+    define query_one(self, sql: String, params: Any = null) -> Map {
+        st := self._prepare(sql, params)
+        rc := step_raw(st)
+        if rc == _ROW {
+            row := row_raw(st)
+            finalize_raw(st)
+            return row
+        }
+        if rc != _DONE { self._fail_stmt(st, sql) }
+        finalize_raw(st)
+        return null
+    }
+
+    ---
+    The first column of the first row (`SELECT count(*) …`), or `default`
+    when there's no row.
+    ---
+    define value(self, sql: String, params: Any = null, default: Any = null) -> Any {
+        st := self._prepare(sql, params)
+        rc := step_raw(st)
+        if rc == _ROW {
+            v := column_value(st, 0)
+            finalize_raw(st)
+            return v
+        }
+        if rc != _DONE { self._fail_stmt(st, sql) }
+        finalize_raw(st)
+        return default
+    }
+
+    --- The column names a SELECT gives (without running it). ---
+    define columns(self, sql: String) -> List {
+        st := self._prepare(sql, null)
+        names := []
+        n := column_count(st)
+        i := 0
+        while i < n {
+            names.append(column_name(st, i))
+            i = i + 1
+        }
+        finalize_raw(st)
+        return names
+    }
+
+    ---
+    Run several statements, separated by `;`, with no parameters: a schema,
+    a migration.
+    ---
+    define script(self, sql: String) -> void {
+        self._check()
+        if exec_raw(self._db, sql) != 0 { self._fail(sql) }
+    }
+
+    ---
+    `with db.transaction() { … }`: the statements inside are done all
+    together or not at all. At the end of the block they're committed; if
+    it raises, they're rolled back (and the exception goes on). Inside
+    another transaction it's a savepoint: only its own part is undone.
+    ---
+    define transaction(self) -> Transaction {
+        self._check()
+        return Transaction(self)
+    }
+
+    --- In a transaction now (`transaction()`, or a BEGIN of your own). ---
+    define in_transaction(self) -> Bool {
+        return self._db != 0 and in_transaction(self._db) != 0
+    }
+
+    --- How many rows the last INSERT / UPDATE / DELETE changed. ---
+    define changes(self) -> Int {
+        self._check()
+        return changes(self._db)
+    }
+
+    --- The id of the last row inserted on this connection. ---
+    define last_id(self) -> Int {
+        self._check()
+        return last_insert_rowid(self._db)
+    }
+
+    --- The names of its tables. ---
+    define tables(self) -> List {
+        names := []
+        for row in self.query("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name") {
+            names.append(row["name"])
+        }
+        return names
+    }
+
+    define _check(self) -> void {
+        if self._db == 0 { throw Error("sqlite: the database is closed", 21, "") }
+    }
+
+    define _fail(self, sql: String) -> void {
+        throw Error("sqlite: " + errmsg(self._db) + _in(sql), errcode(self._db), sql)
+    }
+
+    // The error of a statement that failed, then free it.
+    define _fail_stmt(self, st: Int, sql: String) -> void {
+        msg := errmsg(self._db)
+        code := errcode(self._db)
+        finalize_raw(st)
+        throw Error("sqlite: " + msg + _in(sql), code, sql)
+    }
+
+    define _prepare(self, sql: String, params: Any) -> Int {
+        self._check()
+        st := prepare_raw(self._db, sql)
+        if st == 0 { self._fail(sql) }
+        if st == -1 { throw Error("sqlite: one statement at a time here — for several, db.script(sql)" + _in(sql), 1, sql) }
+        if st == -2 { throw Error("sqlite: no statement in the SQL" + _in(sql), 1, sql) }
+        problem := _bind_all(st, params)
+        if problem != "" {
+            finalize_raw(st)
+            throw Error("sqlite: " + problem + _in(sql), 25, sql)
+        }
+        return st
+    }
+}
+
+// " in: SELECT …" (the start of it).
+define _in(sql: String) -> String {
+    s := sql.trim()
+    if s.length() > 120 { s = s.substring(0, 117) + "..." }
+    return " (in: " + s + ")"
+}
+
+// Bind `params` (a List for ?, a Map for :name) to the statement. "" when
+// it went fine, else what's wrong.
+define _bind_all(st: Int, params: Any) -> String {
+    want := param_count(st)
+    if params == null {
+        if want > 0 { return "the SQL has " + String(want) + " parameter" + (want == 1 ? "" : "s") + " and none were given" }
+        return ""
+    }
+    if params is List {
+        ps: List = params
+        if ps.length() != want {
+            return "the SQL has " + String(want) + " parameter" + (want == 1 ? "" : "s") + ", " + String(ps.length()) + " given"
+        }
+        i := 0
+        while i < want {
+            problem := _bind(st, i + 1, ps[i])
+            if problem != "" { return "parameter " + String(i + 1) + ": " + problem }
+            i = i + 1
+        }
+        return ""
+    }
+    if params is Map {
+        m: Map = params
+        i := 1
+        while i <= want {
+            name := param_name(st, i)
+            if name == "" or name == "?" or name.startswith("?") { return "a Map of parameters needs :names in the SQL, not ?" }
+            key := name.substring(1, name.length())
+            if not m.has(key) { return "no value for " + name + " (the Map has no \"" + key + "\")" }
+            problem := _bind(st, i, m[key])
+            if problem != "" { return name + ": " + problem }
+            i = i + 1
+        }
+        return ""
+    }
+    return "parameters are a List (for ?) or a Map (for :name)"
+}
+
+define _bind(st: Int, i: Int, v: Any) -> String {
+    rc := 0
+    if v is Bool {
+        b: Bool = v
+        rc = bind_int(st, i, b ? 1 : 0)
+    } elif v is Int {
+        n: Int = v
+        rc = bind_int(st, i, n)
+    } elif v is Double {
+        d: Double = v
+        rc = bind_double(st, i, d)
+    } elif v is String {
+        s: String = v
+        rc = bind_text(st, i, s)
+    } elif v == null {
+        rc = bind_null(st, i)
+    } else {
+        kind := v is List ? "List" : (v is Map ? "Map" : "value of this type")
+        return "can't store a " + kind + " (Int, Double, String, Bool or null)"
+    }
+    if rc != 0 { return errstr(rc) }
+    return ""
+}
+
+---
+A transaction (`db.transaction()`), for `with`: committed at the end of
+the block, rolled back if it raises. Inside another one: a savepoint.
+---
+struct Transaction {
+    db: Database
+    _name: String
+
+    define __init(self, db: Database) -> void {
+        self.db = db
+        self._name = ""
+    }
+
+    define __enter(self) -> Transaction {
+        d := self.db
+        if d.in_transaction() {
+            d._savepoints = d._savepoints + 1
+            self._name = "quirk_sp" + String(d._savepoints)
+            d.script("SAVEPOINT " + self._name)
+        } else {
+            d.script("BEGIN")
+        }
+        return self
+    }
+
+    define __exit(self, error: Exception) -> void {
+        d := self.db
+        if not d.is_open() { return }
+        if self._name != "" {
+            if error != null { d.script("ROLLBACK TO " + self._name) }
+            d.script("RELEASE " + self._name)
+            return
+        }
+        if error != null {
+            if d.in_transaction() { d.script("ROLLBACK") }
+            return
+        }
+        d.script("COMMIT")
+    }
+}

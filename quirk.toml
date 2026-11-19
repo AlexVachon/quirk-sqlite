@@ -1,0 +1,8 @@
+name          = "sqlite"
+version       = "1.0.0"
+license       = "MIT"
+description   = "SQLite databases: SQL with ? and :name parameters, rows as Maps, transactions with `with`. SQLite itself is built into Quirk."
+repository    = "github.com/AlexVachon/quirk-sqlite"
+quirk-version = ">=7.50.0"
+
+[deps]

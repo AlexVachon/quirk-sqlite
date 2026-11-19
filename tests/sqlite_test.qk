@@ -1,0 +1,199 @@
+use sqlite
+use test
+use fs
+
+define todo_db() -> sqlite.Database {
+    db := sqlite.open(":memory:")
+    db.script("""
+        CREATE TABLE todos (
+            id   INTEGER PRIMARY KEY,
+            text TEXT NOT NULL UNIQUE,
+            done INTEGER NOT NULL DEFAULT 0,
+            cost REAL
+        );
+        -- a comment, and a second statement
+        CREATE INDEX todos_done ON todos (done);
+    """)
+    return db
+}
+
+define test_insert_query_and_types() -> void {
+    db := todo_db()
+    a := db.insert("INSERT INTO todos (text, cost) VALUES (?, ?)", ["milk", 1.25])
+    b := db.insert("INSERT INTO todos (text, done) VALUES (?, ?)", ["eggs", true])
+    test.assert_eq(a, 1)
+    test.assert_eq(b, 2)
+    rows := db.query("SELECT id, text, done, cost FROM todos ORDER BY id")
+    test.assert_eq(rows.length(), 2)
+    first: Map = rows[0]
+    test.assert_eq(first["text"], "milk")
+    test.assert_true(first["id"] is Int)
+    test.assert_true(first["cost"] is Double)
+    test.assert_eq(String(first["cost"]), "1.25")
+    test.assert_true(first["done"] is Int)
+    test.assert_eq(Int(first["done"]), 0)
+    second: Map = rows[1]
+    test.assert_eq(Int(second["done"]), 1)                       // a Bool is stored as 1
+    test.assert_true(second["cost"] == null)                     // NULL → null
+    test.assert_true(not (second["cost"] is Int))
+    test.assert_eq(", ".join(db.columns("SELECT id, text AS label FROM todos")), "id, label")
+    test.assert_eq(", ".join(db.tables()), "todos")
+    db.close()
+}
+
+define test_params_list_map_and_zero() -> void {
+    db := todo_db()
+    db.execute("INSERT INTO todos (text, done) VALUES (:text, :done)", {"text": "a", "done": 0})
+    db.execute("INSERT INTO todos (text, done) VALUES (?, ?)", ["b", 1])
+    db.execute("INSERT INTO todos (text, done, cost) VALUES (?, ?, ?)", ["c", false, null])
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos WHERE done = ?", [0])), 2)     // 0 is 0, not NULL
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos WHERE done = :d", {"d": true})), 1)
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos WHERE cost IS NULL")), 3)
+    test.assert_true(db.value("SELECT text FROM todos WHERE id = ?", [99]) == null)
+    test.assert_eq(String(db.value("SELECT text FROM todos WHERE id = ?", [99], default="none")), "none")
+    one := db.query_one("SELECT * FROM todos WHERE text = ?", ["b"])
+    test.assert_eq(Int(one["done"]), 1)
+    test.assert_true(db.query_one("SELECT * FROM todos WHERE text = ?", ["zz"]) == null)
+    test.assert_eq(db.execute("UPDATE todos SET done = 1 WHERE done = 0"), 2)
+    test.assert_eq(db.changes(), 2)
+    big := 5000000000
+    db.execute("INSERT INTO todos (text, done) VALUES (?, ?)", ["big", big])
+    test.assert_eq(Int(db.value("SELECT done FROM todos WHERE text = 'big'")), 5000000000)
+    test.assert_eq(String(db.value("SELECT text FROM todos WHERE text = ?", ["héllo ✓"], default="")), "")
+    db.insert("INSERT INTO todos (text) VALUES (?)", ["héllo ✓"])
+    test.assert_eq(String(db.value("SELECT text FROM todos WHERE id = ?", [db.last_id()])), "héllo ✓")
+    db.close()
+}
+
+define test_values_never_change_the_sql() -> void {
+    db := todo_db()
+    evil := "x'); DROP TABLE todos; --"
+    db.insert("INSERT INTO todos (text) VALUES (?)", [evil])
+    test.assert_eq(String(db.value("SELECT text FROM todos")), evil)
+    test.assert_eq(", ".join(db.tables()), "todos")
+    test.assert_eq(db.query("SELECT * FROM todos WHERE text = ?", ["' OR 1=1 --"]).length(), 0)
+    db.close()
+}
+
+define test_errors() -> void {
+    db := todo_db()
+    db.insert("INSERT INTO todos (text) VALUES (?)", ["milk"])
+    caught := ""
+    try {
+        db.insert("INSERT INTO todos (text) VALUES (?)", ["milk"])
+    } catch (e: sqlite.Error) {
+        caught = e.message
+        test.assert_true(e.is_constraint(), String(e.code))
+        test.assert_eq(e.code, 2067)                              // SQLITE_CONSTRAINT_UNIQUE
+        test.assert_true(e.sql.startswith("INSERT"))
+    }
+    test.assert_true(caught.contains("UNIQUE constraint failed: todos.text"), caught)
+    problems := []
+    for sql in ["SELEC nope", "SELECT * FROM nothing_here", "SELECT 1; SELECT 2", "  -- nothing"] {
+        try { db.query(sql) } catch (e: sqlite.Error) { problems.append(e.message) }
+    }
+    test.assert_eq(problems.length(), 4)
+    test.assert_true(String(problems[0]).contains("syntax error"), String(problems[0]))
+    test.assert_true(String(problems[1]).contains("no such table: nothing_here"))
+    test.assert_true(String(problems[2]).contains("db.script"))
+    test.assert_true(String(problems[3]).contains("no statement"))
+    wrong := []
+    try { db.query("SELECT * FROM todos WHERE id = ? AND text = ?", [1]) } catch (e: sqlite.Error) { wrong.append(e.message) }
+    try { db.query("SELECT * FROM todos WHERE id = :id", {"nope": 1}) } catch (e: sqlite.Error) { wrong.append(e.message) }
+    try { db.query("SELECT * FROM todos WHERE id = ?", {"id": 1}) } catch (e: sqlite.Error) { wrong.append(e.message) }
+    try { db.query("SELECT * FROM todos WHERE id = ?", [[1, 2]]) } catch (e: sqlite.Error) { wrong.append(e.message) }
+    try { db.query("SELECT * FROM todos WHERE id = ?") } catch (e: sqlite.Error) { wrong.append(e.message) }
+    test.assert_eq(wrong.length(), 5)
+    test.assert_true(String(wrong[0]).contains("2 parameters, 1 given"), String(wrong[0]))
+    test.assert_true(String(wrong[1]).contains("no value for :id"))
+    test.assert_true(String(wrong[2]).contains(":names"))
+    test.assert_true(String(wrong[3]).contains("can't store a List"), String(wrong[3]))
+    test.assert_true(String(wrong[4]).contains("none were given"))
+    db.close()
+    db.close()                                                     // twice is fine
+    closed := false
+    try { db.query("SELECT 1") } catch (e: sqlite.Error) { closed = e.message.contains("closed") }
+    test.assert_true(closed)
+}
+
+define test_transactions() -> void {
+    db := todo_db()
+    with db.transaction() {
+        test.assert_true(db.in_transaction())
+        db.insert("INSERT INTO todos (text) VALUES (?)", ["a"])
+        db.insert("INSERT INTO todos (text) VALUES (?)", ["b"])
+    }
+    test.assert_false(db.in_transaction())
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos")), 2)
+    // An exception inside: all of it undone, the exception goes on.
+    got := ""
+    try {
+        with db.transaction() {
+            db.insert("INSERT INTO todos (text) VALUES (?)", ["c"])
+            db.insert("INSERT INTO todos (text) VALUES (?)", ["a"])   // UNIQUE: raises
+        }
+    } catch (e: sqlite.Error) {
+        got = "rolled back"
+    }
+    test.assert_eq(got, "rolled back")
+    test.assert_false(db.in_transaction())
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos")), 2)       // no "c"
+    // Nested: the inner one's failure undoes only its part.
+    with db.transaction() {
+        db.insert("INSERT INTO todos (text) VALUES (?)", ["d"])
+        try {
+            with db.transaction() {
+                db.insert("INSERT INTO todos (text) VALUES (?)", ["e"])
+                throw ValueError("changed my mind")
+            }
+        } catch (e: ValueError) {}
+        test.assert_true(db.in_transaction())
+    }
+    texts := []
+    for row in db.query("SELECT text FROM todos ORDER BY text") { texts.append(row["text"]) }
+    test.assert_eq(", ".join(texts), "a, b, d")
+    // A return from inside commits.
+    test.assert_eq(add_two(db), 5)
+    test.assert_false(db.in_transaction())
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos")), 5)
+    test.assert_eq(db.execute_many("INSERT INTO todos (text) VALUES (?)", [["x"], ["y"], ["z"]]), 3)
+    caught := false
+    try {
+        db.execute_many("INSERT INTO todos (text) VALUES (:t)", [{"t": "p"}, {"t": "x"}])     // "x" exists
+    } catch (e: sqlite.Error) { caught = true }
+    test.assert_true(caught)
+    test.assert_eq(Int(db.value("SELECT count(*) FROM todos WHERE text = 'p'")), 0)
+    db.close()
+}
+
+define add_two(db: sqlite.Database) -> Int {
+    with db.transaction() {
+        db.insert("INSERT INTO todos (text) VALUES (?)", ["f"])
+        db.insert("INSERT INTO todos (text) VALUES (?)", ["g"])
+        return Int(db.value("SELECT count(*) FROM todos"))
+    }
+    return -1
+}
+
+define test_a_file_lasts() -> void {
+    dir := fs.temp_dir(prefix="quirk-sqlite-")
+    path := fs.join(dir, "app.db")
+    with sqlite.open(path) as db {
+        db.script("CREATE TABLE notes (body TEXT)")
+        db.insert("INSERT INTO notes VALUES (?)", ["kept"])
+    }
+    test.assert_true(fs.exists(path))
+    again := sqlite.open(path, must_exist=true)
+    test.assert_eq(String(again.value("SELECT body FROM notes")), "kept")
+    again.close()
+    ro := sqlite.open(path, read_only=true)
+    denied := false
+    try { ro.execute("DELETE FROM notes") } catch (e: sqlite.Error) { denied = e.message.contains("readonly") }
+    test.assert_true(denied)
+    ro.close()
+    fs.remove_tree(dir)
+    missing := false
+    try { sqlite.open(path, must_exist=true) } catch (e: sqlite.Error) { missing = e.message.contains("can't open") }
+    test.assert_true(missing)
+    test.assert_true(sqlite.version().startswith("3."))
+}

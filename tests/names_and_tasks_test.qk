@@ -1,0 +1,51 @@
+// A program's own `Error` and sqlite.Error stay apart; tasks share a database.
+use sqlite
+use test
+
+struct Error : RuntimeError {
+    define __init(self, message: String) -> void {
+        super().__init(message)
+    }
+}
+
+define test_own_error_type_and_sqlite_error() -> void {
+    db := sqlite.open(":memory:")
+    which := ""
+    try {
+        db.query("SELECT * FROM missing")
+    } catch (e: Error) {
+        which = "mine"
+    } catch (e: sqlite.Error) {
+        which = "sqlite"
+    }
+    test.assert_eq(which, "sqlite")
+    try {
+        throw Error("x")
+    } catch (e: sqlite.Error) {
+        which = "sqlite"
+    } catch (e: Error) {
+        which = "mine"
+    }
+    test.assert_eq(which, "mine")
+    db.close()
+}
+
+async define writer(db: sqlite.Database, name: String, n: Int) -> Int {
+    i := 0
+    while i < n {
+        db.insert("INSERT INTO log (who, n) VALUES (?, ?)", [name, i])
+        i = i + 1
+    }
+    return n
+}
+
+define test_tasks_share_a_database() -> void {
+    db := sqlite.open(":memory:")
+    db.script("CREATE TABLE log (who TEXT, n INTEGER)")
+    a := writer(db, "a", 200)
+    b := writer(db, "b", 200)
+    test.assert_eq(await a + await b, 400)
+    test.assert_eq(Int(db.value("SELECT count(*) FROM log")), 400)
+    test.assert_eq(Int(db.value("SELECT count(DISTINCT who) FROM log")), 2)
+    db.close()
+}
