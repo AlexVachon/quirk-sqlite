@@ -82,6 +82,45 @@ if row != null {
 }
 ```
 
+### Rows as structs
+
+```quirk
+struct Todo {
+    id: Int
+    text: String
+    done: Bool
+    tags: List
+}
+
+for t in db.query_as(Todo, "SELECT * FROM todos WHERE done = ?", [false]) {
+    todo: Todo = t
+    print(todo.text, todo.tags.length())
+}
+first := db.query_one_as(Todo, "SELECT * FROM todos WHERE id = ?", [id])   // or null
+```
+
+Each column goes in the field of the same name, as that field's type: an
+INTEGER `0` / `1` in a `Bool`, TEXT holding JSON in a `List` or `Map` field, a
+variant's name in an enum field, NULL as the field's zero. Columns with no field
+are left out; fields with no column keep what the struct starts with.
+
+## Schema changes: `migrate`
+
+```quirk
+db.migrate([
+    "CREATE TABLE todos (id INTEGER PRIMARY KEY, text TEXT NOT NULL)",
+    "ALTER TABLE todos ADD COLUMN done INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX todos_done ON todos (done)",
+])
+```
+
+Each step is applied once, in order, in its own transaction (all of it or none
+of it). SQLite remembers how many ran (its `user_version`, also
+`db.schema_version()`), so on the next start only new steps run — call it every
+time the app starts. **Only add steps at the end**; never change one that has
+already run somewhere. A database that's had more steps than the list (an older
+program on a newer database) is refused.
+
 ## Transactions
 
 ```quirk
@@ -123,7 +162,7 @@ connection can be shared by tasks; SQLite is built thread-safe.
 
 ## Requirements
 
-Quirk 7.50.0 or later (SQLite is in its runtime).
+Quirk 7.54.0 or later (SQLite is in its runtime).
 
 ## License
 

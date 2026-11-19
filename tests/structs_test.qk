@@ -1,0 +1,109 @@
+// Rows as structs (query_as / query_one_as) and migrate().
+use sqlite
+use test
+
+enum Priority {
+    Low
+    Normal
+    High
+}
+
+struct Todo {
+    id: Int
+    text: String
+    done: Bool
+    cost: Double
+    tags: List
+    meta: Map
+    priority: Priority
+    note: String
+
+    define __init(self) -> void {
+        self.id = 0
+        self.text = ""
+        self.done = false
+        self.cost = 0.0
+        self.tags = []
+        self.meta = {}
+        self.priority = Priority.Normal
+        self.note = "(none)"
+    }
+
+    define label(self) -> String {
+        return (self.done ? "[x] " : "[ ] ") + self.text
+    }
+}
+
+define setup() -> sqlite.Database {
+    db := sqlite.open(":memory:")
+    db.migrate([
+        "CREATE TABLE todos (id INTEGER PRIMARY KEY, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)",
+        "ALTER TABLE todos ADD COLUMN cost REAL; ALTER TABLE todos ADD COLUMN tags TEXT DEFAULT '[]'",
+        "ALTER TABLE todos ADD COLUMN priority TEXT NOT NULL DEFAULT 'Normal'; ALTER TABLE todos ADD COLUMN meta TEXT",
+    ])
+    db.execute("INSERT INTO todos (text, done, cost, tags, priority, meta) VALUES (?, ?, ?, ?, ?, ?)",
+               ["milk", true, 1.5, "[\"shop\", \"food\"]", "High", "{\"aisle\": 4}"])
+    db.execute("INSERT INTO todos (text) VALUES (?)", ["docs"])
+    return db
+}
+
+define test_rows_as_structs() -> void {
+    db := setup()
+    rows := db.query_as(Todo, "SELECT * FROM todos ORDER BY id")
+    test.assert_eq(rows.length(), 2)
+    a: Todo = rows[0]
+    test.assert_eq(a.id, 1)
+    test.assert_eq(a.text, "milk")
+    test.assert_true(a.done)                                   // INTEGER 1 → Bool
+    test.assert_eq(String(a.cost), "1.5")
+    test.assert_eq(a.tags.length(), 2)                          // JSON text → List
+    test.assert_eq(String(a.tags[1]), "food")
+    test.assert_eq(Int(a.meta["aisle"]), 4)                     // JSON text → Map
+    test.assert_true(a.priority == Priority.High)               // a name → the enum
+    test.assert_eq(a.note, "(none)")                            // no column: as made
+    test.assert_eq(a.label(), "[x] milk")                       // a real Todo: its methods
+    b: Todo = rows[1]
+    test.assert_false(b.done)                                   // INTEGER 0 → false
+    test.assert_eq(b.label(), "[ ] docs")
+    test.assert_true(b.priority == Priority.Normal)
+    test.assert_eq(b.cost, 0.0)                                 // NULL → the field's zero
+    test.assert_eq(b.tags.length(), 0)
+    for t in db.query_as(Todo, "SELECT id, text, 'extra' AS unknown FROM todos WHERE done = ?", [false]) {
+        todo: Todo = t
+        test.assert_eq(todo.text, "docs")                        // unknown columns: left out
+    }
+    one := db.query_one_as(Todo, "SELECT * FROM todos WHERE text = ?", ["milk"])
+    test.assert_true(one != null)
+    m: Todo = one
+    test.assert_eq(m.id, 1)
+    test.assert_true(db.query_one_as(Todo, "SELECT * FROM todos WHERE id = ?", [99]) == null)
+    db.execute("UPDATE todos SET tags = 'not json' WHERE id = 2")
+    bad := ""
+    try { db.query_as(Todo, "SELECT * FROM todos") } catch (e: sqlite.Error) { bad = e.message }
+    test.assert_true(bad.contains("tags isn't JSON"), bad)
+    db.close()
+}
+
+define test_migrate() -> void {
+    db := sqlite.open(":memory:")
+    steps := ["CREATE TABLE a (x INTEGER)", "CREATE TABLE b (y INTEGER)"]
+    test.assert_eq(db.migrate(steps), 2)
+    test.assert_eq(db.schema_version(), 2)
+    test.assert_eq(db.migrate(steps), 0)                       // done: nothing runs again
+    steps.append("ALTER TABLE a ADD COLUMN z TEXT")
+    test.assert_eq(db.migrate(steps), 1)                       // only the new one
+    test.assert_eq(", ".join(db.tables()), "a, b")
+    test.assert_eq(", ".join(db.columns("SELECT * FROM a")), "x, z")
+    // A step that fails: none of it is kept, the version stays.
+    steps.append("CREATE TABLE c (k INTEGER); CREATE TABLE a (oops)")
+    failed := false
+    try { db.migrate(steps) } catch (e: sqlite.Error) { failed = e.message.contains("already exists") }
+    test.assert_true(failed)
+    test.assert_eq(db.schema_version(), 3)
+    test.assert_eq(", ".join(db.tables()), "a, b")              // no "c"
+    // Steps taken away (an older program on a newer database): refused.
+    newer := false
+    try { db.migrate(["CREATE TABLE a (x INTEGER)"]) } catch (e: sqlite.Error) { newer = e.message.contains("newer") }
+    test.assert_true(newer)
+    db.close()
+}

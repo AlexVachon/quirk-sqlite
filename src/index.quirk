@@ -27,6 +27,7 @@ from typing.primitives.string use { String }
 from typing.collections.list use { List }
 from typing.collections.map use { Map }
 from typing.exceptions.types use { RuntimeError, ValueError }
+use encoding.json
 
 extern define open_raw(path: String, mode: Int, busy_ms: Int) -> Int
 extern define open_error() -> String
@@ -56,6 +57,12 @@ extern define in_transaction(db: Int) -> Int
 
 --- The version of SQLite built into Quirk ("3.54.1"). ---
 extern define version() -> String
+
+extern define has_field(obj: Any, name: String) -> Bool
+extern define set_field(obj: Any, name: String, value: Any) -> Bool
+extern define field_type(obj: Any, name: String) -> String
+extern define field_names(obj: Any) -> List
+extern define type_name(obj: Any) -> String
 
 const _ROW: Int = 100
 const _DONE: Int = 101
@@ -213,6 +220,94 @@ struct Database {
     }
 
     ---
+    Every row of a SELECT as a `make` — a struct type: each column goes in
+    the field of the same name, as that field's type (an INTEGER 0 / 1 in a
+    Bool, TEXT holding JSON in a List or Map field, a name in an enum).
+    Columns with no field are left out; fields with no column keep what
+    the struct starts with (it's made with no arguments: its __init's
+    parameters get their defaults, or zero).
+
+        struct Todo {
+            id: Int
+            text: String
+            done: Bool
+        }
+
+        for t in db.query_as(Todo, "SELECT * FROM todos WHERE done = ?", [false]) {
+            todo: Todo = t
+            print(todo.text)
+        }
+    ---
+    define query_as(self, make: Callable, sql: String, params: Any = null) -> List {
+        st := self._prepare(sql, params)
+        out := []
+        kinds := null
+        rc := step_raw(st)
+        while rc == _ROW {
+            obj := make()
+            if kinds == null { kinds = _kinds_for(obj, st) }
+            _fill(obj, row_raw(st), kinds)
+            out.append(obj)
+            rc = step_raw(st)
+        }
+        if rc != _DONE { self._fail_stmt(st, sql) }
+        finalize_raw(st)
+        return out
+    }
+
+    --- The first row of a SELECT as a `make` (see query_as), or null when there's none. ---
+    define query_one_as(self, make: Callable, sql: String, params: Any = null) -> Any {
+        st := self._prepare(sql, params)
+        rc := step_raw(st)
+        if rc == _ROW {
+            obj := make()
+            _fill(obj, row_raw(st), _kinds_for(obj, st))
+            finalize_raw(st)
+            return obj
+        }
+        if rc != _DONE { self._fail_stmt(st, sql) }
+        finalize_raw(st)
+        return null
+    }
+
+    ---
+    Bring the database's schema up to date: `steps` are SQL scripts, in
+    order, each applied once. SQLite keeps how many were applied (its
+    `user_version`); the ones after that run now, each in a transaction
+    (all of a step, or none of it). Returns how many ran. Only ever add
+    steps at the end — never change one that has run somewhere.
+
+        db.migrate([
+            "CREATE TABLE todos (id INTEGER PRIMARY KEY, text TEXT NOT NULL)",
+            "ALTER TABLE todos ADD COLUMN done INTEGER NOT NULL DEFAULT 0",
+        ])
+    ---
+    define migrate(self, steps: List) -> Int {
+        self._check()
+        at := Int(self.value("PRAGMA user_version"))
+        if at > steps.length() {
+            throw Error("sqlite: the database is at schema version " + String(at) + ", newer than the " + String(steps.length()) + " steps given", 1, "")
+        }
+        ran := 0
+        i := at
+        while i < steps.length() {
+            step := String(steps[i])
+            with self.transaction() {
+                self.script(step)
+                self.script("PRAGMA user_version = " + String(i + 1))
+            }
+            ran = ran + 1
+            i = i + 1
+        }
+        return ran
+    }
+
+    --- How many migrate() steps the database has had (its `user_version`). ---
+    define schema_version(self) -> Int {
+        return Int(self.value("PRAGMA user_version"))
+    }
+
+    ---
     The first column of the first row (`SELECT count(*) …`), or `default`
     when there's no row.
     ---
@@ -318,6 +413,52 @@ struct Database {
         }
         return st
     }
+}
+
+// For each column of the statement: [name, the field's type] when `obj`
+// has a field of that name; columns with none are left out.
+define _kinds_for(obj: Any, st: Int) -> List {
+    kinds := []
+    n := column_count(st)
+    i := 0
+    while i < n {
+        name := column_name(st, i)
+        if has_field(obj, name) { kinds.append([name, field_type(obj, name)]) }
+        i = i + 1
+    }
+    return kinds
+}
+
+// The row's values in obj's fields, each as its field's type.
+define _fill(obj: Any, row: Map, kinds: List) -> void {
+    for k in kinds {
+        pair: List = k
+        name: String = pair[0]
+        kind: String = pair[1]
+        set_field(obj, name, _as_kind(row[name], kind, obj, name))
+    }
+}
+
+define _as_kind(v: Any, kind: String, obj: Any, name: String) -> Any {
+    if v == null { return null }
+    if kind == "Int" { return Int(v) }
+    if kind == "Double" { return Double(v) }
+    if kind == "Bool" {
+        if v is String {
+            t := String(v).lower()
+            return t == "1" or t == "true" or t == "yes"
+        }
+        return Bool(v)
+    }
+    if kind == "String" { return String(v) }
+    if (kind == "List" or kind.startswith("List[") or kind == "Map" or kind.startswith("Map[")) and v is String {
+        try {
+            return json.loads(String(v))
+        } catch (e: Exception) {
+            throw Error("sqlite: column " + name + " isn't JSON, for " + type_name(obj) + "." + name + " (" + kind + "): " + e.message, 20, "")
+        }
+    }
+    return v
 }
 
 // " in: SELECT …" (the start of it).
